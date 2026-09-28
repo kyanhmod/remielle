@@ -338,12 +338,7 @@ fn serveStream(
         else => |e| return e,
     };
 
-    defer {
-        task.connection_index_by_uid_mutex.lockUncancelable(io);
-        defer task.connection_index_by_uid_mutex.unlock(io);
-
-        assert(task.connection_index_by_uid.swapRemove(task.connection.session.uid));
-    }
+    defer releasePlayerUId(io, task);
 
     try task.connection.writeAll(io, sink.buffered());
     sink.end = 0;
@@ -418,6 +413,11 @@ fn processFirstCommand(
 
     const get_or_create = try task.persistent.getOrCreatePlayerUid(io, request.account_uid, gpa);
 
+    if (!try takePlayerUid(io, task, get_or_create.player_uid))
+        return error.PlayerBusy;
+
+    errdefer releasePlayerUId(io, task);
+
     task.connection.session = .{
         .uid = get_or_create.player_uid,
         .packet_id_counter = 0,
@@ -464,15 +464,28 @@ fn processFirstCommand(
         &task.connection.session.xorpad,
         mem.readInt(u64, client_rand_key[0..8], .little) ^ server_rand_key,
     );
+}
 
+/// Try to "take the ownership" of player uid by adding index of task to the map.
+fn takePlayerUid(io: Io, task: *const Task, uid: u32) Io.Cancelable!bool {
     try task.connection_index_by_uid_mutex.lock(io);
     defer task.connection_index_by_uid_mutex.unlock(io);
 
-    // TODO: if another session already exists, it has to be kicked out
-    task.connection_index_by_uid.putAssumeCapacityNoClobber(
-        get_or_create.player_uid,
-        task.index,
-    );
+    const gop = task.connection_index_by_uid.getOrPutAssumeCapacity(uid);
+    if (gop.found_existing) return false;
+
+    gop.value_ptr.* = uid;
+    task.connection.session.uid = uid;
+
+    return true;
+}
+
+fn releasePlayerUId(io: Io, task: *const Task) void {
+    task.connection_index_by_uid_mutex.lockUncancelable(io);
+    defer task.connection_index_by_uid_mutex.unlock(io);
+
+    assert(task.connection_index_by_uid.swapRemove(task.connection.session.uid));
+    task.connection.session.uid = 0;
 }
 
 fn processCommandLoggedIn(
