@@ -11,7 +11,7 @@ We also maintain an in-house implementation of `protobuf` serializer and compile
 
 ## Requirements
 To build **Remielle** from sources you need:
-- Zig Compiler, version `0.17.0-dev.2018+ab30a0b9a`: [Linux](https://ziglang.org/builds/zig-x86_64-linux-0.17.0-dev.2018+ab30a0b9a.tar.xz)/[Windows](https://ziglang.org/builds/zig-x86_64-windows-0.17.0-dev.2018+ab30a0b9a.zip)
+- Zig Compiler, version `0.17.0-dev.2320+1e770dbef`: [Linux](https://ziglang.org/builds/zig-x86_64-linux-0.17.0-dev.2320+1e770dbef.tar.xz)/[Windows](https://ziglang.org/builds/zig-x86_64-windows-0.17.0-dev.2320+1e770dbef.zip)
 
 For use with the game client, the client patch is required: [thaumiel](https://git.xeondev.com/remielle/thaumiel)
 

@@ -423,7 +423,7 @@ fn fillCompleted(u: *Uring) void {
                 };
 
                 const cqe_err: linux.E = if (res > -4096 and res < 0)
-                    errno(@intCast(-res))
+                    errno(-res)
                 else
                     .SUCCESS;
 

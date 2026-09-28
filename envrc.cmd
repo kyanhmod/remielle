@@ -2,7 +2,7 @@
 setlocal EnableExtensions DisableDelayedExpansion
 pushd "%~dp0" || exit /b 1
 
-set "ZIG_VERSION=0.17.0-dev.2018+ab30a0b9a"
+set "ZIG_VERSION=0.17.0-dev.2320+1e770dbef"
 
 for /f "delims=" %%V in ('zig version 2^>nul') do (
     if "%%V"=="%ZIG_VERSION%" goto :shell
