@@ -1,5 +1,5 @@
 const builtin = @import("builtin");
-const is_windows = builtin.os.tag == .windows;
+const is_windows = builtin.target.os.tag == .windows;
 
 const std = @import("std");
 const Io = std.Io;

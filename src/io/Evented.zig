@@ -2102,8 +2102,8 @@ test {
 }
 
 const is_windows = native_os == .windows;
-const native_os = builtin.os.tag;
-const is_debug = builtin.mode == .debug;
+const native_os = builtin.target.os.tag;
+const is_debug = builtin.optimize == .debug;
 
 const abort = std.process.abort;
 
