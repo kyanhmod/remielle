@@ -349,6 +349,11 @@ fn serveStream(
     sink.end = 0;
 
     while (protocol.Command.decode(&stream_reader.interface)) |command| {
+        if (protobuf.features.isAvailable(.log_out)) {
+            if (command.id == protobuf.main_desc.PlayerLogoutCsReq.cmd_id)
+                return;
+        }
+
         try processCommandLoggedIn(io, gpa, task, &command, &sink);
 
         const to_write = sink.buffered();
