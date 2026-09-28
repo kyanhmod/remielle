@@ -1,8 +1,15 @@
 // TODO: this is retarded, rewrite it.
+const Persistent = @This();
+
+const std = @import("std");
+const Io = std.Io;
+const Allocator = std.mem.Allocator;
 
 const remielle = @import("remielle");
 const protobuf = remielle.protobuf;
 const PlayerSave = protobuf.stable.PlayerSave;
+
+const logic = @import("logic.zig");
 
 const log = std.log.scoped(.@"remielle-gamesv::persistent");
 
@@ -112,6 +119,7 @@ pub fn loadPlayer(
     return try protobuf.decode(.stable, PlayerSave, arena, &fr.interface);
 }
 
+/// Threadsafe.
 pub fn savePlayer(
     persistent: *const Persistent,
     io: Io,
@@ -169,10 +177,3 @@ pub fn saveCalendar(persistent: *const Persistent, io: Io) !void {
 fn ensureDirectories(io: Io, root: Io.Dir) !void {
     try root.createDirPath(io, "Persistent/LocalStorage/");
 }
-
-const Io = std.Io;
-const Allocator = std.mem.Allocator;
-
-const logic = @import("logic.zig");
-const std = @import("std");
-const Persistent = @This();

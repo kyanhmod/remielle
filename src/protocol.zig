@@ -15,38 +15,27 @@ pub const Command = struct {
     head: []u8,
     body: []u8,
 
-    pub const Decoded = struct {
-        command: Command,
-        consumed_bytes: usize,
-    };
-
-    pub const DecodeError = error{
+    pub const DecodeError = Io.Reader.Error || error{
         MagicNumberMismatch,
     };
 
-    pub fn decode(bytes: []u8) DecodeError!?Decoded {
-        if (bytes.len < overhead) return null;
+    pub fn decode(reader: *Io.Reader) DecodeError!Command {
+        const recv_head_magic = try reader.takeInt(u32, .big);
+        if (recv_head_magic != head_magic) return error.MagicNumberMismatch;
 
-        if (mem.readInt(u32, bytes[0..4], .big) != head_magic)
-            return error.MagicNumberMismatch;
+        const cmd_id = try reader.takeInt(u16, .big);
+        const head_len = try reader.takeInt(u16, .big);
+        const body_len = try reader.takeInt(u32, .big);
 
-        const cmd_id = mem.readInt(u16, bytes[4..6], .big);
-        const head_len = mem.readInt(u16, bytes[6..8], .big);
-        const body_len = mem.readInt(u32, bytes[8..12], .big);
-
-        if (bytes.len < overhead + head_len + body_len)
-            return null;
-
-        if (mem.readInt(u32, bytes[12 + head_len + body_len ..][0..4], .big) != tail_magic)
+        // head, body, tail_magic
+        const rest = try reader.take(head_len + body_len + @sizeOf(u32));
+        if (mem.readInt(u32, rest[head_len + body_len ..][0..4], .big) != tail_magic)
             return error.MagicNumberMismatch;
 
         return .{
-            .command = .{
-                .id = cmd_id,
-                .head = bytes[12..][0..head_len],
-                .body = bytes[12 + head_len ..][0..body_len],
-            },
-            .consumed_bytes = overhead + head_len + body_len,
+            .id = cmd_id,
+            .head = rest[0..head_len],
+            .body = rest[head_len..][0..body_len],
         };
     }
 

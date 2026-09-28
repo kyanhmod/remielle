@@ -5,6 +5,7 @@ const std = @import("std");
 const Io = std.Io;
 const mem = std.mem;
 const net = std.Io.net;
+const Random = std.Random;
 const process = std.process;
 const assert = std.debug.assert;
 const ArrayList = std.ArrayList;
@@ -23,6 +24,9 @@ const messaging = @import("messaging.zig");
 const Persistent = @import("Persistent.zig");
 
 const initial_xorpad: *const [4096]u8 = @embedFile("initial_xorpad");
+
+const recv_buffer_size = 32 * 1024;
+const send_buffer_size = 32 * 1024;
 
 const log = std.log.scoped(.@"remielle-gamesv");
 
@@ -110,17 +114,6 @@ pub fn main(init: process.Init.Minimal) !void {
     const address = net.IpAddress.parseLiteral(args.@"--listen-address") catch |err|
         fatal("bad --listen-address: {t}", .{err});
 
-    var csprng_seed: [DefaultCsprng.secret_seed_length]u8 = undefined;
-    io.randomSecure(&csprng_seed) catch |err| switch (err) {
-        error.Canceled => unreachable,
-        error.EntropyUnavailable => if (args.@"--require-secure-random")
-            fatal("secure entropy source is uavailable", .{})
-        else
-            io.random(&csprng_seed),
-    };
-
-    var csprng: DefaultCsprng = .init(csprng_seed);
-
     var asset_lookup = assets.Lookup.init(gpa) catch |err| switch (err) {
         error.OutOfMemory => fatal("out of memory", .{}),
     };
@@ -138,9 +131,9 @@ pub fn main(init: process.Init.Minimal) !void {
     };
     defer net_server.deinit(io);
 
-    var session_index_by_uid: std.array_hash_map.Auto(u32, u32) = .empty;
-    defer session_index_by_uid.deinit(gpa);
-    session_index_by_uid.ensureTotalCapacity(gpa, args.@"--concurrency") catch
+    var connection_index_by_uid: std.array_hash_map.Auto(u32, u32) = .empty;
+    defer connection_index_by_uid.deinit(gpa);
+    connection_index_by_uid.ensureTotalCapacity(gpa, args.@"--concurrency") catch
         fatal(
             \\failed to allocate memory for {d} sessions
             \\likely cause: --concurrency is higher than the system can process
@@ -154,13 +147,8 @@ pub fn main(init: process.Init.Minimal) !void {
     defer gpa.free(player_uids);
     @memset(player_uids, 0);
 
-    const sessions = gpa.alloc(Session, args.@"--concurrency") catch
-        fatal(
-            \\failed to allocate memory for {d} sessions
-            \\likely cause: --concurrency is higher than the system can process
-        , .{args.@"--concurrency"});
-    defer gpa.free(sessions);
-
+    // TODO: compress allocation of `connections`, `recv_buffers`, `send_buffers`
+    // into a single `alignedAlloc` call.
     const connections = gpa.alloc(Connection, args.@"--concurrency") catch
         fatal(
             \\failed to allocate memory for {d} sessions
@@ -168,35 +156,79 @@ pub fn main(init: process.Init.Minimal) !void {
         , .{args.@"--concurrency"});
     defer gpa.free(connections);
 
+    const recv_buffers = gpa.alloc(u8, args.@"--concurrency" * recv_buffer_size) catch
+        fatal(
+            \\failed to allocate memory for {d} sessions
+            \\likely cause: --concurrency is higher than the system can process
+        , .{args.@"--concurrency"});
+    defer gpa.free(recv_buffers);
+
+    const send_buffers = gpa.alloc(u8, args.@"--concurrency" * send_buffer_size) catch
+        fatal(
+            \\failed to allocate memory for {d} sessions
+            \\likely cause: --concurrency is higher than the system can process
+        , .{args.@"--concurrency"});
+    defer gpa.free(send_buffers);
+
     var persistent = Persistent.init(io, gpa, .cwd()) catch |err| switch (err) {
         error.Canceled => |e| return e,
         else => |e| fatal("failed to initialize Persistent: {t}", .{e}),
     };
-
     defer persistent.deinit(gpa);
 
-    var event_queue: Io.Queue(Connection.Event) = .init(&.{});
-
-    const game: Game = .{
-        .csprng = csprng.random(),
+    var game: Game = .{
         .asset_lookup = &asset_lookup,
-        .session_index_by_uid = &session_index_by_uid,
-        .player_uids = player_uids,
-        .sessions = sessions,
         .connections = connections,
-        .event_queue = &event_queue,
+        .connection_index_by_uid = &connection_index_by_uid,
+        .connection_index_by_uid_mutex = .init,
         .persistent = &persistent,
+        .persistent_mutex = .init,
     };
 
-    var connection_group: Io.Group = .init;
-    defer connection_group.cancel(io);
+    var client_task_group: Io.Group = .init;
+    defer client_task_group.cancel(io);
 
     for (game.connections, 0..) |*connection, index| {
-        connection.initPinned(@intCast(index));
-        connection_group.concurrent(
+        const recv_buffer = recv_buffers[recv_buffer_size * index ..][0..recv_buffer_size];
+        const send_buffer = send_buffers[send_buffer_size * index ..][0..send_buffer_size];
+
+        var task: Task = .{
+            .index = @intCast(index),
+
+            .csprng_seed = undefined, // populated by `randomSecure` below.
+            .net_server = &net_server,
+            .asset_lookup = &asset_lookup,
+
+            .persistent = &persistent,
+            .persistent_mutex = &game.persistent_mutex,
+
+            .connection_index_by_uid = &connection_index_by_uid,
+            .connection_index_by_uid_mutex = &game.connection_index_by_uid_mutex,
+
+            .recv_buffer = recv_buffer,
+            .send_buffer = send_buffer,
+            .connection = connection,
+        };
+
+        connection.* = .{
+            .mutex = .init,
+            .sending = .is_set, // `is_set` indicates no pending net_write.
+            .stream_maybe = null,
+            .session = undefined,
+        };
+
+        io.randomSecure(&task.csprng_seed) catch |err| switch (err) {
+            error.Canceled => unreachable,
+            error.EntropyUnavailable => if (args.@"--require-secure-random")
+                fatal("secure entropy source is uavailable", .{})
+            else
+                io.random(&task.csprng_seed),
+        };
+
+        client_task_group.concurrent(
             io,
-            runConnectionTask,
-            .{ io, connection, &net_server, &event_queue },
+            runClientTask,
+            .{ io, gpa, task },
         ) catch
             fatal(
                 \\failed to allocate concurrency for {d} sessions
@@ -204,8 +236,12 @@ pub fn main(init: process.Init.Minimal) !void {
             , .{args.@"--concurrency"});
     }
 
-    var server_task = try io.concurrent(runServerTask, .{ io, gpa, &game });
-    defer server_task.cancel(io) catch {};
+    // TODO: start control protocol task
+
+    try remielle.splash.print(io);
+
+    log.info("waiting for clients at tcp://{f}", .{net_server.socket.address});
+    defer log.info("shutting down...", .{});
 
     switch (io_mode) {
         .evented => evented_instance.waitForShutdown(),
@@ -214,126 +250,175 @@ pub fn main(init: process.Init.Minimal) !void {
 }
 
 const Game = struct {
-    csprng: std.Random,
     asset_lookup: *const assets.Lookup,
-    session_index_by_uid: *std.array_hash_map.Auto(u32, u32),
-    player_uids: []u32,
-    sessions: []Session,
     connections: []Connection,
-    event_queue: *Io.Queue(Connection.Event),
+    /// Not threadsafe. Lock `connection_index_by_uid_mutex` before operating on it.
+    connection_index_by_uid: *std.array_hash_map.Auto(u32, u32),
+    connection_index_by_uid_mutex: Io.Mutex,
+    /// Not threadsafe. Lock `persistent_mutex` before operating on it.
     persistent: *Persistent,
+    persistent_mutex: Io.Mutex,
 };
 
-const Session = struct {
-    packet_id_counter: u32,
-    xorpad: [4096]u8,
-    properties: logic.Properties,
+const Task = struct {
+    index: u32,
+
+    csprng_seed: [DefaultCsprng.secret_seed_length]u8,
+    asset_lookup: *const assets.Lookup,
+    net_server: *net.Server,
+
+    /// Not threadsafe. Lock `persistent_mutex` before operating on it.
+    persistent: *Persistent,
+    persistent_mutex: *Io.Mutex,
+
+    /// Not threadsafe. Lock `connection_index_by_uid_mutex` before operating on it.
+    connection_index_by_uid: *std.array_hash_map.Auto(u32, u32),
+    connection_index_by_uid_mutex: *Io.Mutex,
+
+    connection: *Connection,
+    recv_buffer: []u8,
+    send_buffer: []u8,
 };
 
-fn runServerTask(io: Io, gpa: Allocator, game: *const Game) Io.Cancelable!void {
-    try remielle.splash.print(io);
-    var send_buffer: [32 * 1024]u8 = undefined;
-    _ = &send_buffer;
+fn runClientTask(io: Io, gpa: Allocator, task: Task) Io.Cancelable!void {
+    var csprng: DefaultCsprng = .init(task.csprng_seed);
 
-    while (game.event_queue.getOne(io)) |event| {
-        switch (event) {
-            .disconnected => |disconnected| {
-                const uid = game.player_uids[disconnected.index];
-                if (uid == 0) continue;
+    while (true) {
+        const stream = task.net_server.accept(io) catch |err| switch (err) {
+            error.Canceled => |e| return e,
+            else => continue,
+        };
+        defer stream.close(io);
 
-                assert(game.session_index_by_uid.swapRemove(uid));
-                game.player_uids[disconnected.index] = 0;
+        log.info("new connection from {f}", .{stream.socket.address});
+        defer log.info("connection from {f} closed", .{stream.socket.address});
+
+        try task.connection.setStream(io, stream);
+        defer task.connection.removeStream(io);
+
+        serveStream(io, gpa, csprng.random(), &task, stream) catch |err| switch (err) {
+            error.Canceled => |e| return e,
+            else => |e| {
+                log.err("failed to serve client from {f}: {t}", .{ stream.socket.address, e });
+                continue;
             },
-            .readable => |readable| {
-                defer readable.done.set(io);
+        };
+    }
+}
 
-                var sink: Io.Writer = .fixed(&send_buffer);
-                const time: Io.Timestamp = .now(io, .real);
-                const session = &game.sessions[readable.index];
-                const connection = &game.connections[readable.index];
+fn serveStream(
+    io: Io,
+    gpa: Allocator,
+    csprng: Random,
+    task: *const Task,
+    stream: net.Stream,
+) !void {
+    var stream_reader = stream.reader(io, task.recv_buffer);
+    var sink: Io.Writer = .fixed(task.send_buffer);
 
-                for (readable.commands) |*command| {
-                    const uid = game.player_uids[readable.index];
-                    if (uid == 0) {
-                        processFirstCommand(
-                            io,
-                            gpa,
-                            game,
-                            readable.index,
-                            command,
-                            &sink,
-                        ) catch |err| switch (err) {
-                            error.Canceled => |e| return e,
-                            else => |e| {
-                                log.err("failed to process first command: {t}", .{e});
-                                connection.should_close = true;
-                            },
-                        };
-                    } else {
-                        protocol.xor(command.body, &session.xorpad);
-
-                        var arena: std.heap.ArenaAllocator = .init(gpa);
-                        defer arena.deinit();
-
-                        messaging.handlers.process(
-                            arena.allocator(),
-                            time,
-                            &.{
-                                .packet_id_counter = &session.packet_id_counter,
-                                .xorpad = &session.xorpad,
-                                .writer = &sink,
-                            },
-                            &session.properties,
-                            game.asset_lookup,
-                            &game.persistent.calendar,
-                            command,
-                        ) catch |err|
-                            log.debug("process failed: {t}", .{err});
-                    }
-                }
-
-                var arena: std.heap.ArenaAllocator = .init(gpa);
-                defer arena.deinit();
-
-                const uid = game.player_uids[readable.index];
-                if (uid != 0) {
-                    const player_save = logic.Properties.toPlayerSave(
-                        &session.properties,
-                        arena.allocator(),
-                    ) catch |err| switch (err) {
-                        error.OutOfMemory => {
-                            // TODO: get rid of protobuf for saves to avoid this error.
-                            log.err("ran out of memory while constructing save for UID {d}", .{uid});
-                            return;
-                        },
-                    };
-
-                    const old_cancel_protection = io.swapCancelProtection(.blocked);
-                    defer _ = io.swapCancelProtection(old_cancel_protection);
-
-                    game.persistent.savePlayer(io, uid, player_save) catch |err| switch (err) {
-                        error.Canceled => unreachable, // blocked
-                        else => |e| log.err("failed to save player with UID {d}: {t}", .{ uid, e }),
-                    };
-                }
-
-                const written = sink.buffered();
-                if (written.len != 0)
-                    try game.connections[readable.index].writeAll(io, written);
-            },
-        }
-    } else |err| switch (err) {
+    processFirstCommand(
+        io,
+        gpa,
+        csprng,
+        task,
+        &stream_reader.interface,
+        &sink,
+    ) catch |err| switch (err) {
         error.Canceled => |e| return e,
-        error.Closed => unreachable,
+        error.EndOfStream => return,
+        error.ReadFailed => switch (stream_reader.err.?) {
+            error.Canceled => |e| return e,
+            else => return,
+        },
+        error.WriteFailed => {
+            log.err("send_buffer exceeded while processing first command", .{});
+            return;
+        },
+
+        error.OutOfMemory,
+        error.MagicNumberMismatch,
+        error.UnexpectedFirstCmdId,
+        error.MalformedPayload,
+        error.DecryptFail,
+        error.WriteFileFailed,
+        error.InvalidUid,
+        => |e| return e,
+    };
+
+    defer {
+        task.connection_index_by_uid_mutex.lockUncancelable(io);
+        defer task.connection_index_by_uid_mutex.unlock(io);
+
+        assert(task.connection_index_by_uid.swapRemove(task.connection.session.uid));
+    }
+
+    try task.connection.writeAll(io, sink.buffered());
+    sink.end = 0;
+
+    const uid = task.connection.session.uid;
+
+    while (protocol.Command.decode(&stream_reader.interface)) |command| {
+        protocol.xor(command.body, &task.connection.session.xorpad);
+        const time: Io.Timestamp = .now(io, .real);
+
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+
+        messaging.handlers.process(
+            arena.allocator(),
+            time,
+            &.{
+                .packet_id_counter = &task.connection.session.packet_id_counter,
+                .xorpad = &task.connection.session.xorpad,
+                .writer = &sink,
+            },
+            &task.connection.session.properties,
+            task.asset_lookup,
+            &task.persistent.calendar,
+            &command,
+        ) catch |err| {
+            log.debug("process failed: {t}", .{err});
+            return;
+        };
+
+        const player_save = task.connection.session.properties.toPlayerSave(
+            arena.allocator(),
+        ) catch |err| switch (err) {
+            error.OutOfMemory => {
+                // TODO: get rid of protobuf for saves to avoid this error.
+                log.err("ran out of memory while constructing save for UID {d}", .{uid});
+                return;
+            },
+        };
+
+        const old_cancel_protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(old_cancel_protection);
+
+        task.persistent.savePlayer(io, uid, player_save) catch |err| switch (err) {
+            error.Canceled => unreachable, // blocked
+            else => |e| log.err("failed to save player with UID {d}: {t}", .{ uid, e }),
+        };
+
+        try task.connection.writeAll(io, sink.buffered());
+        sink.end = 0;
+    } else |err| switch (err) {
+        error.EndOfStream,
+        error.MagicNumberMismatch,
+        => return,
+
+        error.ReadFailed => switch (stream_reader.err.?) {
+            error.Canceled => |e| return e,
+            else => {},
+        },
     }
 }
 
 fn processFirstCommand(
     io: Io,
     gpa: Allocator,
-    game: *const Game,
-    session_index: u32,
-    command: *const protocol.Command,
+    csprng: Random,
+    task: *const Task,
+    reader: *Io.Reader,
     sink: *Io.Writer,
 ) !void {
     // TODO: eliminate heap allocations (blocked by Persistent rewrite)
@@ -341,6 +426,8 @@ fn processFirstCommand(
     var arena_instance: std.heap.ArenaAllocator = .init(gpa);
     defer arena_instance.deinit();
     const arena = arena_instance.allocator();
+
+    const command: protocol.Command = try .decode(reader);
 
     if (command.id != protobuf.main_desc.PlayerGetTokenCsReq.cmd_id)
         return error.UnexpectedFirstCmdId;
@@ -366,25 +453,36 @@ fn processFirstCommand(
     if (client_rand_key.len != 8)
         return error.DecryptFail;
 
-    const get_or_create = try game.persistent.getOrCreatePlayerUid(io, request.account_uid, gpa);
-    game.sessions[session_index].packet_id_counter = 0;
-    game.sessions[session_index].properties = .init;
+    try task.persistent_mutex.lock(io);
+    defer task.persistent_mutex.unlock(io);
+
+    const get_or_create = try task.persistent.getOrCreatePlayerUid(io, request.account_uid, gpa);
+
+    task.connection.session = .{
+        .uid = get_or_create.player_uid,
+        .packet_id_counter = 0,
+        .properties = .init,
+        .xorpad = undefined,
+    };
 
     if (get_or_create.created) {
-        game.sessions[session_index].properties.setDefaults();
+        task.connection.session.properties.setDefaults();
     } else blk: {
         // TODO: less retarded way of loading this.
 
-        if (game.persistent.loadPlayer(io, arena, get_or_create.player_uid)) |player_save| {
-            if (game.sessions[session_index].properties.fromPlayerSave(&player_save))
+        if (task.persistent.loadPlayer(io, arena, get_or_create.player_uid)) |player_save| {
+            if (task.connection.session.properties.fromPlayerSave(&player_save))
                 break :blk
             else |_| {}
-        } else |_| {}
+        } else |err| switch (err) {
+            error.Canceled => |e| return e,
+            else => {},
+        }
 
-        game.sessions[session_index].properties.setDefaults();
+        task.connection.session.properties.setDefaults();
     }
 
-    const server_rand_key = game.csprng.int(u64);
+    const server_rand_key = csprng.int(u64);
     var encrypt_buffer: remielle.rsa.EncryptAndSignBuffer = undefined;
     remielle.rsa.encryptAndSign(&encrypt_buffer, @ptrCast(&server_rand_key));
 
@@ -403,52 +501,86 @@ fn processFirstCommand(
     );
 
     protocol.getDecryptVector(
-        &game.sessions[session_index].xorpad,
+        &task.connection.session.xorpad,
         mem.readInt(u64, client_rand_key[0..8], .little) ^ server_rand_key,
     );
 
-    game.player_uids[session_index] = get_or_create.player_uid;
-    game.session_index_by_uid.putAssumeCapacity(get_or_create.player_uid, session_index);
+    try task.connection_index_by_uid_mutex.lock(io);
+    defer task.connection_index_by_uid_mutex.unlock(io);
+
+    // TODO: if another session already exists, it has to be kicked out
+    task.connection_index_by_uid.putAssumeCapacityNoClobber(
+        get_or_create.player_uid,
+        task.index,
+    );
 }
 
 const Connection = struct {
-    const command_batch_size = 32;
-
-    index: u32,
-
-    /// Used only to protect against accidental closure.
-    /// Contention is unlikely, so this is fine.
-    stream_mutex: Io.Mutex,
+    /// Guards `sending.reset`, `session`.
+    mutex: Io.Mutex,
+    /// `unset` when a `net_write` operation is pending on the stream.
+    sending: Io.Event,
+    /// Not threadsafe.
+    /// Use `writeAll` to access this.
     stream_maybe: ?Io.net.Stream,
+    /// Not threadsafe. Lock `mutex` before operating on it.
+    session: Session,
 
-    read_buffer: [32 * 1024]u8,
-    read_done: Io.Event,
-    should_close: bool,
-
-    const Event = union(enum) {
-        readable: struct {
-            index: u32,
-            commands: []protocol.Command,
-            done: *Io.Event,
-        },
-        disconnected: struct {
-            index: usize,
-        },
+    const Session = struct {
+        uid: u32,
+        packet_id_counter: u32,
+        xorpad: [4096]u8,
+        properties: logic.Properties,
     };
 
-    fn initPinned(connection: *Connection, index: u32) void {
-        connection.index = index;
-        connection.stream_mutex = .init;
+    // TODO: might as well introduce timeout to avoid indefinitely blocking
+    // in case client died upon `net_write`.
+    fn acquireWrite(connection: *Connection, io: Io) Io.Cancelable!?net.Stream {
+        // Make sure no one else will be `wait`ing concurrently.
+        try connection.mutex.lock(io);
+        defer connection.mutex.unlock(io);
+
+        try connection.sending.wait(io);
+        const stream = connection.stream_maybe orelse return null;
+
+        // Note that `reset` may happen only under a mutex to prevent others racing on `wait`.
+        connection.sending.reset();
+        return stream;
+    }
+
+    fn releaseWrite(connection: *Connection, io: Io) void {
+        assert(!connection.sending.isSet()); // always a race condition
+        connection.sending.set(io);
+    }
+
+    fn setStream(connection: *Connection, io: Io, stream: net.Stream) Io.Cancelable!void {
+        assert(connection.stream_maybe == null);
+        assert(connection.sending.isSet());
+
+        try connection.mutex.lock(io);
+        defer connection.mutex.unlock(io);
+
+        connection.stream_maybe = stream;
+    }
+
+    fn removeStream(connection: *Connection, io: Io) void {
+        assert(connection.stream_maybe != null);
+        defer {
+            assert(connection.sending.isSet());
+            assert(connection.stream_maybe == null);
+        }
+
+        connection.mutex.lockUncancelable(io);
+        defer connection.mutex.unlock(io);
+
+        connection.sending.waitUncancelable(io);
         connection.stream_maybe = null;
-        connection.read_done = .unset;
-        connection.should_close = false;
     }
 
     fn writeAll(connection: *Connection, io: Io, buffer: []const u8) Io.Cancelable!void {
-        try connection.stream_mutex.lock(io);
-        defer connection.stream_mutex.unlock(io);
+        const stream = try connection.acquireWrite(io) orelse return;
+        defer connection.releaseWrite(io);
 
-        const stream = connection.stream_maybe orelse return;
         var remaining = buffer;
 
         while (remaining.len != 0) {
@@ -464,125 +596,3 @@ const Connection = struct {
         }
     }
 };
-
-fn runConnectionTask(
-    io: Io,
-    context: *Connection,
-    server: *Io.net.Server,
-    queue: *Io.Queue(Connection.Event),
-) Io.Cancelable!void {
-    while (true) {
-        const stream = server.accept(io) catch |err| switch (err) {
-            error.Canceled => |e| return e,
-            else => continue,
-        };
-
-        try context.stream_mutex.lock(io);
-        assert(context.stream_maybe == null);
-        context.stream_maybe = stream;
-        context.stream_mutex.unlock(io);
-
-        receiveMessages(io, context, &stream, queue) catch |err| switch (err) {
-            error.Canceled => |e| return e,
-            error.ConnectionResetByPeer => {},
-            else => |e| log.debug(
-                "failed to read messages from {f}: {t}",
-                .{ stream.socket.address, e },
-            ),
-        };
-
-        queue.putOne(
-            io,
-            .{ .disconnected = .{ .index = context.index } },
-        ) catch |err| switch (err) {
-            error.Canceled => |e| return e,
-            error.Closed => unreachable,
-        };
-
-        try context.stream_mutex.lock(io);
-        context.stream_maybe.?.close(io);
-        context.stream_maybe = null;
-        context.stream_mutex.unlock(io);
-    }
-}
-
-fn receiveMessages(
-    io: Io,
-    context: *Connection,
-    stream: *const net.Stream,
-    queue: *Io.Queue(Connection.Event),
-) !void {
-    var read_buffer_end: usize = 0;
-    context.should_close = false;
-
-    while (true) {
-        var vector: [1][]u8 = .{context.read_buffer[read_buffer_end..]};
-        const result = try io.operate(.{ .net_read = .{
-            .socket_handle = stream.socket.handle,
-            .data = &vector,
-        } });
-
-        const read_n = try result.net_read;
-        if (read_n == 0) return error.EndOfStream;
-
-        read_buffer_end += read_n;
-        const readable = context.read_buffer[0..read_buffer_end];
-
-        var batch_buffer: [Connection.command_batch_size]protocol.Command = undefined;
-        var batch: ArrayList(protocol.Command) = .initBuffer(&batch_buffer);
-
-        var consumed_n: usize = 0;
-        defer {
-            const new_end = read_buffer_end - consumed_n;
-            @memmove(
-                context.read_buffer[0..new_end],
-                context.read_buffer[consumed_n..read_buffer_end],
-            );
-
-            read_buffer_end = new_end;
-        }
-
-        while (try protocol.Command.decode(readable[consumed_n..])) |decoded| {
-            consumed_n += decoded.consumed_bytes;
-
-            batch.appendBounded(decoded.command) catch {
-                context.read_done = .unset;
-
-                queue.putOne(io, .{ .readable = .{
-                    .index = context.index,
-                    .commands = batch.items,
-                    .done = &context.read_done,
-                } }) catch |err| switch (err) {
-                    error.Canceled => |e| return e,
-                    error.Closed => unreachable,
-                };
-
-                try context.read_done.wait(io);
-
-                if (context.should_close)
-                    return;
-
-                batch.items.len = 0;
-                batch.appendAssumeCapacity(decoded.command);
-            };
-        }
-
-        if (batch.items.len != 0) {
-            context.read_done = .unset;
-
-            queue.putOne(io, .{ .readable = .{
-                .index = context.index,
-                .commands = batch.items,
-                .done = &context.read_done,
-            } }) catch |err| switch (err) {
-                error.Canceled => |e| return e,
-                error.Closed => unreachable,
-            };
-
-            try context.read_done.wait(io);
-
-            if (context.should_close)
-                return;
-        }
-    }
-}
