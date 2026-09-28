@@ -11,9 +11,6 @@ pub const IoMode = enum {
 };
 
 pub fn build(b: *Build) void {
-    // TODO: use b.dependOn* functionality once it's implemented by the build system.
-    b.graph.poisonCache();
-
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const io_mode = b.option(
@@ -331,6 +328,8 @@ fn configureGameServer(b: *Build, steps: struct {
 }
 
 fn importAllFrom(b: *Build, module: *Build.Module, dir_path: []const u8) void {
+    b.dependOnDirectoryContents(b.path(dir_path));
+
     const dir = b.root.openDir(b.graph.io, dir_path, .{ .iterate = true }) catch |err|
         std.debug.panic("failed to open {q}: {t}", .{ dir_path, err });
     defer dir.close(b.graph.io);
