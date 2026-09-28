@@ -335,14 +335,7 @@ fn serveStream(
             return;
         },
 
-        error.OutOfMemory,
-        error.MagicNumberMismatch,
-        error.UnexpectedFirstCmdId,
-        error.MalformedPayload,
-        error.DecryptFail,
-        error.WriteFileFailed,
-        error.InvalidUid,
-        => |e| return e,
+        else => |e| return e,
     };
 
     defer {
@@ -355,52 +348,14 @@ fn serveStream(
     try task.connection.writeAll(io, sink.buffered());
     sink.end = 0;
 
-    const uid = task.connection.session.uid;
-
     while (protocol.Command.decode(&stream_reader.interface)) |command| {
-        protocol.xor(command.body, &task.connection.session.xorpad);
-        const time: Io.Timestamp = .now(io, .real);
+        try processCommandLoggedIn(io, gpa, task, &command, &sink);
 
-        var arena: std.heap.ArenaAllocator = .init(gpa);
-        defer arena.deinit();
-
-        messaging.handlers.process(
-            arena.allocator(),
-            time,
-            &.{
-                .packet_id_counter = &task.connection.session.packet_id_counter,
-                .xorpad = &task.connection.session.xorpad,
-                .writer = &sink,
-            },
-            &task.connection.session.properties,
-            task.asset_lookup,
-            &task.persistent.calendar,
-            &command,
-        ) catch |err| {
-            log.debug("process failed: {t}", .{err});
-            return;
-        };
-
-        const player_save = task.connection.session.properties.toPlayerSave(
-            arena.allocator(),
-        ) catch |err| switch (err) {
-            error.OutOfMemory => {
-                // TODO: get rid of protobuf for saves to avoid this error.
-                log.err("ran out of memory while constructing save for UID {d}", .{uid});
-                return;
-            },
-        };
-
-        const old_cancel_protection = io.swapCancelProtection(.blocked);
-        defer _ = io.swapCancelProtection(old_cancel_protection);
-
-        task.persistent.savePlayer(io, uid, player_save) catch |err| switch (err) {
-            error.Canceled => unreachable, // blocked
-            else => |e| log.err("failed to save player with UID {d}: {t}", .{ uid, e }),
-        };
-
-        try task.connection.writeAll(io, sink.buffered());
-        sink.end = 0;
+        const to_write = sink.buffered();
+        if (to_write.len != 0) {
+            try task.connection.writeAll(io, sink.buffered());
+            sink.end = 0;
+        }
     } else |err| switch (err) {
         error.EndOfStream,
         error.MagicNumberMismatch,
@@ -513,6 +468,52 @@ fn processFirstCommand(
         get_or_create.player_uid,
         task.index,
     );
+}
+
+fn processCommandLoggedIn(
+    io: Io,
+    gpa: Allocator,
+    task: *const Task,
+    command: *const protocol.Command,
+    sink: *Io.Writer,
+) !void {
+    protocol.xor(command.body, &task.connection.session.xorpad);
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+
+    try task.connection.mutex.lock(io); // Lock for accessing `properties`.
+    defer task.connection.mutex.unlock(io);
+
+    const time: Io.Timestamp = .now(io, .real);
+
+    messaging.handlers.process(
+        arena.allocator(),
+        time,
+        &.{
+            .packet_id_counter = &task.connection.session.packet_id_counter,
+            .xorpad = &task.connection.session.xorpad,
+            .writer = sink,
+        },
+        &task.connection.session.properties,
+        task.asset_lookup,
+        &task.persistent.calendar,
+        command,
+    ) catch |err| switch (err) {
+        error.WriteFailed => return error.SendBufferExceeded,
+        else => |e| return e,
+    };
+
+    const uid = task.connection.session.uid;
+    const player_save = try task.connection.session.properties.toPlayerSave(arena.allocator());
+
+    const old_cancel_protection = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(old_cancel_protection);
+
+    task.persistent.savePlayer(io, uid, player_save) catch |err| switch (err) {
+        error.Canceled => unreachable, // blocked
+        else => |e| log.err("failed to save player with UID {d}: {t}", .{ uid, e }),
+    };
 }
 
 const Connection = struct {
